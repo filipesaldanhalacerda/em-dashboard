@@ -34,7 +34,7 @@ const CONFIG = {
   orgUrl: 'https://dev.azure.com/MetLife-Global',
   project: 'BR Life',
   projectEncoded: 'BR%20Life',
-  repositorio: '11431_br-cotador-metlife-services',
+  repositorio: '53f9c6c2-4eeb-4733-91a9-5b43a94ffb65',
   time: 'Cotador Individual',
   totalDevs: 10,
   apiVersion: '7.1',
