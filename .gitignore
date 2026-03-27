@@ -1,0 +1,21 @@
+# Credenciais — NUNCA commitar
+.env
+
+# Dados coletados (podem conter info sensível do time)
+data/
+
+# Node
+node_modules/
+
+# Dashboard gerado (é artefato, não fonte)
+index.html
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+*.suo
+*.user

@@ -1,0 +1,17 @@
+{
+  "name": "em-dashboard-metlife-br-life",
+  "version": "1.0.0",
+  "description": "Engineering Manager Dashboard — Cotador Individual | MetLife BR Life",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "collect": "node collect.js",
+    "dashboard": "node generate-dashboard.js",
+    "start": "node collect.js && node generate-dashboard.js"
+  },
+  "private": true,
+  "author": "MetLife BR Life — Time Cotador Individual",
+  "license": "UNLICENSED"
+}

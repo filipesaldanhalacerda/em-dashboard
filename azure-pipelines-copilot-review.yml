@@ -1,0 +1,347 @@
+# azure-pipelines-copilot-review.yml
+# Pipeline de revisão automática de PR via GitHub Copilot Business
+# Time: Cotador Individual | MetLife BR Life
+#
+# Pré-requisito: Variable Group "copilot-review" com:
+#   - AZURE_DEVOPS_PAT  (secret) — PAT com Code Read+Write
+#   - GITHUB_PAT        (secret) — PAT GitHub da conta filipe-s-lacerda_met, scope: copilot
+#
+# Como criar o Variable Group:
+#   Azure DevOps → BR Life → Pipelines → Library → + Variable group → nome: copilot-review
+
+trigger: none  # Não executa em push direto
+
+# Executa em toda PR aberta ou atualizada no repositório principal
+pr:
+  branches:
+    include:
+      - main
+      - master
+      - develop
+      - release/*
+      - feature/*
+  paths:
+    include:
+      - '**/*.cs'       # Apenas quando houver mudanças em C#
+      - '**/*.csproj'
+      - '**/*.json'
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: copilot-review  # Carrega AZURE_DEVOPS_PAT e GITHUB_PAT do Library
+  - name: ORG_URL
+    value: 'https://dev.azure.com/MetLife-Global'
+  - name: PROJECT
+    value: 'BR Life'
+  - name: REPO_ID
+    value: '11431_br-cotador-metlife-services'
+  - name: API_VERSION
+    value: '7.1'
+
+steps:
+
+# ─── Passo 1: Coleta o diff da PR ────────────────────────────────────────────
+- script: |
+    echo "##[section]Coletando diff da PR #$(System.PullRequest.PullRequestId)"
+
+    PR_ID="$(System.PullRequest.PullRequestId)"
+    AUTH=$(echo -n ":$(AZURE_DEVOPS_PAT)" | base64 -w 0)
+    PROJECT_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$(PROJECT)'))")
+
+    # Busca os arquivos alterados na PR
+    CHANGES_URL="$(ORG_URL)/${PROJECT_ENC}/_apis/git/repositories/$(REPO_ID)/pullRequests/${PR_ID}/iterations?api-version=$(API_VERSION)"
+
+    echo "Buscando iterações da PR..."
+    ITERATIONS=$(curl -sf -H "Authorization: Basic ${AUTH}" "${CHANGES_URL}")
+
+    if [ $? -ne 0 ] || [ -z "${ITERATIONS}" ]; then
+      echo "##[error]Falha ao buscar iterações da PR. Verifique o AZURE_DEVOPS_PAT."
+      exit 1
+    fi
+
+    # Pega o número da última iteração
+    LAST_ITER=$(echo "${ITERATIONS}" | python3 -c "
+    import json, sys
+    data = json.load(sys.stdin)
+    iters = data.get('value', [])
+    print(iters[-1]['id'] if iters else 1)
+    ")
+
+    echo "Última iteração: ${LAST_ITER}"
+
+    # Busca os changes da última iteração
+    CHANGES_URL2="$(ORG_URL)/${PROJECT_ENC}/_apis/git/repositories/$(REPO_ID)/pullRequests/${PR_ID}/iterations/${LAST_ITER}/changes?api-version=$(API_VERSION)"
+    CHANGES=$(curl -sf -H "Authorization: Basic ${AUTH}" "${CHANGES_URL2}")
+
+    # Extrai os arquivos .cs modificados
+    FILES=$(echo "${CHANGES}" | python3 -c "
+    import json, sys
+    data = json.load(sys.stdin)
+    items = data.get('changeEntries', [])
+    cs_files = [
+      i['item']['path'] for i in items
+      if i.get('item', {}).get('path', '').endswith(('.cs', '.csproj'))
+      and i.get('changeType', '') not in ('delete',)
+    ]
+    print('\n'.join(cs_files[:10]))  # Limita a 10 arquivos
+    ")
+
+    if [ -z "${FILES}" ]; then
+      echo "Nenhum arquivo .cs alterado nesta PR. Encerrando revisão."
+      echo "##vso[task.setvariable variable=HAS_CS_FILES]false"
+      exit 0
+    fi
+
+    echo "Arquivos C# para revisar:"
+    echo "${FILES}"
+    echo "##vso[task.setvariable variable=HAS_CS_FILES]true"
+
+    # Para cada arquivo, busca o conteúdo da versão da PR
+    DIFFS_COMBINED=""
+
+    while IFS= read -r FILE_PATH; do
+      [ -z "${FILE_PATH}" ] && continue
+
+      # Busca conteúdo do arquivo na branch da PR
+      CONTENT_URL="$(ORG_URL)/${PROJECT_ENC}/_apis/git/repositories/$(REPO_ID)/items?path=${FILE_PATH}&version=$(System.PullRequest.SourceBranch)&api-version=$(API_VERSION)"
+      CONTENT=$(curl -sf -H "Authorization: Basic ${AUTH}" "${CONTENT_URL}" 2>/dev/null | head -c 8000)
+
+      if [ -n "${CONTENT}" ]; then
+        DIFFS_COMBINED="${DIFFS_COMBINED}\n\n### Arquivo: ${FILE_PATH}\n\`\`\`csharp\n${CONTENT}\n\`\`\`"
+      fi
+    done <<< "${FILES}"
+
+    # Salva o conteúdo combinado
+    echo -e "${DIFFS_COMBINED}" > /tmp/pr_diff.txt
+    echo "Tamanho do diff: $(wc -c < /tmp/pr_diff.txt) bytes"
+
+    # Salva lista de arquivos para usar no comentário
+    echo "${FILES}" > /tmp/pr_files.txt
+  displayName: 'Passo 1 — Coletar diff da PR'
+  env:
+    AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+
+# ─── Passo 2: Obtém token temporário do Copilot ──────────────────────────────
+- script: |
+    echo "##[section]Obtendo token temporário do GitHub Copilot"
+
+    # Chama a API interna do Copilot para obter token de 30 minutos
+    RESPONSE=$(curl -sf \
+      -H "Authorization: token $(GITHUB_PAT)" \
+      -H "Accept: application/json" \
+      "https://api.github.com/copilot_internal/v2/token")
+
+    if [ $? -ne 0 ] || [ -z "${RESPONSE}" ]; then
+      echo "##[error]Falha ao obter token do Copilot. Verifique o GITHUB_PAT."
+      echo "##[error]O PAT precisa ter o scope 'copilot' e pertencer à conta filipe-s-lacerda_met."
+      exit 1
+    fi
+
+    # Extrai o token da resposta
+    COPILOT_TOKEN=$(echo "${RESPONSE}" | python3 -c "
+    import json, sys
+    data = json.load(sys.stdin)
+    print(data.get('token', ''))
+    ")
+
+    if [ -z "${COPILOT_TOKEN}" ]; then
+      echo "##[error]Token Copilot vazio na resposta."
+      echo "Resposta recebida: ${RESPONSE}"
+      exit 1
+    fi
+
+    echo "Token Copilot obtido com sucesso (válido 30 min)"
+
+    # Exporta como variável secreta de pipeline (não aparece nos logs)
+    echo "##vso[task.setvariable variable=COPILOT_TOKEN;issecret=true]${COPILOT_TOKEN}"
+  displayName: 'Passo 2 — Obter token Copilot'
+  env:
+    GITHUB_PAT: $(GITHUB_PAT)
+  condition: eq(variables['HAS_CS_FILES'], 'true')
+
+# ─── Passo 3: Chama o Copilot Chat API com o diff ────────────────────────────
+- script: |
+    echo "##[section]Enviando diff ao Copilot para revisão"
+
+    DIFF_CONTENT=$(cat /tmp/pr_diff.txt)
+    FILES_LIST=$(cat /tmp/pr_files.txt | tr '\n' ', ')
+
+    # Monta o prompt de revisão especializado para MetLife BR Life
+    PROMPT="Você é um revisor sênior de código C#/.NET para um sistema financeiro regulado (SUSEP/BACEN) da MetLife Brasil. Revise o código a seguir com foco nos pontos críticos abaixo.
+
+## Contexto
+- Sistema: Cotador de seguros de vida individual
+- Stack: .NET 8+, ASP.NET, Clean Architecture, xUnit
+- Ambiente regulado: LGPD + SUSEP/BACEN
+
+## O que verificar (ordem de prioridade)
+
+### 🔴 CRÍTICO — Bugs e Segurança
+- NullReferenceException potencial (objetos não verificados antes de usar)
+- Violações OWASP Top 10: injeção SQL, XSS, exposição de dados sensíveis
+- LOG DE DADOS SENSÍVEIS: CPF, nome do segurado, valor de apólice, dados bancários — NUNCA devem aparecer em logs
+- Bypass de validações regulatórias SUSEP/BACEN (ex: campos obrigatórios comentados, validações removidas)
+- Dados sensíveis em mensagens de exceção ou retornos de API
+
+### 🟡 ATENÇÃO — Qualidade e Arquitetura
+- Violações de SOLID (especialmente SRP e DIP)
+- Clean Architecture violada (ex: domínio referenciando infraestrutura)
+- Código assíncrono sem await (async void, .Result, .Wait())
+- new HttpClient() instanciado diretamente (deve usar IHttpClientFactory)
+- Magic numbers sem constantes nomeadas
+- catch {} vazio ou que engole exceções silenciosamente
+- Console.WriteLine em código de produção (usar ILogger)
+- Queries N+1 em Entity Framework (loop com chamada ao DB a cada iteração)
+
+### 🔵 SUGESTÃO — Melhorias
+- Ausência de testes unitários xUnit para lógica de negócio nova
+- Possibilidade de simplificação ou uso de padrões CQRS
+- Nomes não seguindo convenção: PascalCase classes/métodos, camelCase variáveis
+- Domínio de negócio deveria estar em português
+
+## Código para revisar
+${DIFF_CONTENT}
+
+## Formato obrigatório da resposta
+
+Para cada problema encontrado, use EXATAMENTE este formato:
+
+## 🤖 Revisão Copilot — ${FILES_LIST}
+
+🔴 **Bug crítico** — [descrição clara do problema] (linha aproximada se identificável)
+🟡 **Atenção** — [descrição] (linha aproximada)
+🔵 **Sugestão** — [descrição] (linha aproximada)
+
+Se não houver problemas críticos:
+✅ **Sem ressalvas críticas** — [breve resumo positivo do código]
+
+Seja direto e objetivo. Máximo 600 palavras."
+
+    # Escapa o prompt para JSON
+    PROMPT_JSON=$(python3 -c "
+import json, sys
+prompt = sys.stdin.read()
+print(json.dumps(prompt))
+" <<< "${PROMPT}")
+
+    # Monta o body da requisição
+    REQUEST_BODY=$(python3 -c "
+import json
+body = {
+  'model': 'gpt-4o',
+  'messages': [
+    {
+      'role': 'system',
+      'content': 'Você é um revisor sênior de código C#/.NET com foco em sistemas financeiros regulados. Seja preciso, direto e use apenas o formato solicitado.'
+    },
+    {
+      'role': 'user',
+      'content': json.loads('''${PROMPT_JSON}''')
+    }
+  ],
+  'max_tokens': 1500,
+  'temperature': 0.1
+}
+print(json.dumps(body))
+")
+
+    # Chama o Copilot Chat API
+    REVIEW_RESPONSE=$(curl -sf \
+      -X POST \
+      -H "Authorization: Bearer $(COPILOT_TOKEN)" \
+      -H "Content-Type: application/json" \
+      -H "Copilot-Integration-Id: vscode-chat" \
+      -H "Editor-Version: vscode/1.85.0" \
+      -H "Editor-Plugin-Version: copilot-chat/0.12.0" \
+      "https://api.githubcopilot.com/chat/completions" \
+      -d "${REQUEST_BODY}")
+
+    if [ $? -ne 0 ] || [ -z "${REVIEW_RESPONSE}" ]; then
+      echo "##[error]Falha ao chamar o Copilot Chat API."
+      exit 1
+    fi
+
+    # Extrai o texto da revisão
+    REVIEW_TEXT=$(echo "${REVIEW_RESPONSE}" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+choices = data.get('choices', [])
+if choices:
+    print(choices[0].get('message', {}).get('content', 'Sem resposta do Copilot'))
+else:
+    print('Erro: Copilot não retornou choices. Resposta: ' + json.dumps(data)[:500])
+")
+
+    echo "Revisão Copilot recebida:"
+    echo "---"
+    echo "${REVIEW_TEXT}"
+    echo "---"
+
+    # Salva a revisão para o próximo passo
+    echo "${REVIEW_TEXT}" > /tmp/copilot_review.txt
+  displayName: 'Passo 3 — Chamar Copilot Chat API'
+  env:
+    COPILOT_TOKEN: $(COPILOT_TOKEN)
+  condition: eq(variables['HAS_CS_FILES'], 'true')
+
+# ─── Passo 4: Posta o resultado como comentário na PR ────────────────────────
+- script: |
+    echo "##[section]Postando revisão como comentário na PR"
+
+    PR_ID="$(System.PullRequest.PullRequestId)"
+    AUTH=$(echo -n ":$(AZURE_DEVOPS_PAT)" | base64 -w 0)
+    PROJECT_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$(PROJECT)'))")
+    REVIEW_TEXT=$(cat /tmp/copilot_review.txt)
+
+    # Adiciona rodapé informativo ao comentário
+    COMMENT_BODY="${REVIEW_TEXT}
+
+---
+*Revisão automática gerada por GitHub Copilot Business — conta filipe-s-lacerda_met / met-github*
+*Pipeline: $(Build.BuildId) · $(Build.DefinitionName) · $(Agent.Name)*"
+
+    # Monta o payload do comentário
+    COMMENT_JSON=$(python3 -c "
+import json, sys
+body = sys.stdin.read()
+payload = {
+  'comments': [{
+    'parentCommentId': 0,
+    'content': body,
+    'commentType': 1
+  }],
+  'status': 1
+}
+print(json.dumps(payload))
+" <<< "${COMMENT_BODY}")
+
+    # Posta o comentário via Azure DevOps Threads API
+    THREAD_URL="$(ORG_URL)/${PROJECT_ENC}/_apis/git/repositories/$(REPO_ID)/pullRequests/${PR_ID}/threads?api-version=$(API_VERSION)"
+
+    RESPONSE=$(curl -sf \
+      -X POST \
+      -H "Authorization: Basic ${AUTH}" \
+      -H "Content-Type: application/json" \
+      "${THREAD_URL}" \
+      -d "${COMMENT_JSON}")
+
+    if [ $? -ne 0 ]; then
+      echo "##[error]Falha ao postar comentário na PR."
+      echo "Response: ${RESPONSE}"
+      exit 1
+    fi
+
+    THREAD_ID=$(echo "${RESPONSE}" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(data.get('id', 'desconhecido'))
+")
+
+    echo "✅ Comentário postado com sucesso! Thread ID: ${THREAD_ID}"
+    echo "   PR: $(ORG_URL)/$(PROJECT_ENC)/_git/$(REPO_ID)/pullrequest/${PR_ID}"
+  displayName: 'Passo 4 — Postar comentário na PR'
+  env:
+    AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+  condition: eq(variables['HAS_CS_FILES'], 'true')
